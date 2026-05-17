@@ -23,6 +23,7 @@ const float IDLE_SPEED = 2.0;                     // < 2 km/h 视为静止
 #include <ESPAsyncWebServer.h>
 #include <TinyGPS++.h>
 #include <SPIFFS.h>
+#include <ArduinoOTA.h>
 
 // ==================== 全局变量 ====================
 TinyGPSPlus gps;
@@ -463,6 +464,12 @@ void setup() {
   Serial.print("IP 地址: ");
   Serial.println(WiFi.softAPIP());
 
+  // OTA 无线升级
+  ArduinoOTA.setHostname("esp32-gps");
+  ArduinoOTA.setPassword("12345678");
+  ArduinoOTA.begin();
+  Serial.println("OTA 就绪: esp32-gps");
+
   setupRoutes();
   server.begin();
   Serial.println("Web 服务器已启动");
@@ -470,6 +477,7 @@ void setup() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
   readGPS();
   recordPoint();
   delay(50);
