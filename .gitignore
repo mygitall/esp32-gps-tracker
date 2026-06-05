@@ -1,9 +1,20 @@
-# Arduino 编译产物
+# Build
 build/
+build_v2/
+*.bin
+*.elf
+*.map
+*.o
+*.d
+*.cache
+*.csv
+sdkconfig
+file_opts
+flash_args
+includes.cache
+libraries.cache
 
-# macOS
+# IDE
 .DS_Store
-
 *.swp
 *.swo
-*~
