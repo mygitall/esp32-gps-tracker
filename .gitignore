@@ -18,3 +18,4 @@ libraries.cache
 .DS_Store
 *.swp
 *.swo
+.claude/worktrees/

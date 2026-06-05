@@ -104,6 +104,15 @@ bool init4G() {
   return ip.indexOf(".")>0;
 }
 
+// ===== 海拔滤波 =====
+#define ALT_N 10
+float altBuf[ALT_N]; int altI=0, altC=0;
+float filterAlt(float raw) {
+  altBuf[altI]=raw; altI=(altI+1)%ALT_N; if(altC<ALT_N)altC++;
+  float s=0; for(int i=0;i<altC;i++)s+=altBuf[i];
+  return s/altC;
+}
+
 // ===== 主程序 =====
 void setup() {
   Serial.begin(115200); delay(500);
@@ -120,7 +129,7 @@ void loop() {
   while(Serial2.available()){
     if(gps.encode(Serial2.read())){
       if(gps.location.isValid()){lat=gps.location.lat();lng=gps.location.lng();fix=true;}
-      if(gps.altitude.isValid())alt=gps.altitude.meters();
+      if(gps.altitude.isValid())alt=filterAlt(gps.altitude.meters());
       if(gps.speed.isValid())spd=gps.speed.kmph();
       if(gps.satellites.isValid())sat=gps.satellites.value();
     }
@@ -133,13 +142,34 @@ void loop() {
   }
 
   static unsigned long lp=0;
-  if(fix && millis()-lp>10000){lp=millis();
+  if(fix && millis()-lp>15000){lp=millis();
     char json[128];
     snprintf(json,sizeof(json),"{\"lat\":%.6f,\"lng\":%.6f,\"alt\":%.1f,\"spd\":%.1f,\"sat\":%d,\"fix\":1}",
              lat,lng,alt,spd,sat);
+
+    // 1. MQTT
     Serial.printf("MQTT>> %s\n",json);
-    if(mqttPublish(json)) Serial.println("PUB OK");
-    else Serial.println("PUB FAIL");
+    mqttPublish(json);
+
+    // 2. HTTP POST
+    String post="api_key=esp32&data="+String(json);
+    Serial1.print("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80\r\n");
+    String r; unsigned long t=millis();
+    while(millis()-t<8000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
+    if(r.indexOf("CONNECT")>=0){
+      String http="POST /esp32/mmq/api.php HTTP/1.1\r\nHost: www.sseeee.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ";
+      http += String(post.length());
+      http += "\r\nConnection: close\r\n\r\n";
+      http += post;
+      while(Serial1.available())Serial1.read();
+      Serial1.print("AT+CIPSEND="); Serial1.print(http.length()); Serial1.print("\r\n");
+      String w; t=millis();
+      while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
+      if(w.indexOf(">")>=0){Serial1.print(http);delay(2000);}
+      Serial1.print("AT+CIPCLOSE\r\n");delay(500);
+      while(Serial1.available())Serial1.read();
+      Serial.println("HTTP OK");
+    }
   }
   delay(50);
 }
