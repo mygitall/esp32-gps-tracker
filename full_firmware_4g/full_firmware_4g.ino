@@ -86,14 +86,29 @@ bool mqttPublish(const char* json) {
   return false;
 }
 
+// ===== Air780EX PWRKEY 自动开机 =====
+#define AIR_PWR 27
+void airPowerOn() {
+  Serial.println("PWRKEY 开机...");
+  pinMode(AIR_PWR, OUTPUT);
+  digitalWrite(AIR_PWR, LOW);   // 默认低电平，三极管不导通
+  delay(500);
+  digitalWrite(AIR_PWR, HIGH);  // 高电平 → 三极管导通 → PWRKEY 拉低
+  delay(1500);                   // 保持 1.5 秒
+  digitalWrite(AIR_PWR, LOW);   // 释放
+  delay(5000);                   // 等 Air780EX 启动
+  Serial.println("PWRKEY 释放");
+}
+
 // ===== 4G 初始化 =====
 bool init4G() {
-  Serial.println("init 4G...");
+  airPowerOn();
+
   // 重试 AT
   for(int i=0;i<5;i++){
     if(atCmd("AT").indexOf("OK")>=0) break;
     Serial.printf("retry %d\n",i+1);
-    delay(500);
+    delay(1000);
   }
   if(atCmd("AT").indexOf("OK")<0){Serial.println("AT FAIL");return false;}
   atCmd("AT+CGATT=1",5000);
@@ -104,8 +119,9 @@ bool init4G() {
   return ip.indexOf(".")>0;
 }
 
-// ===== 海拔滤波 =====
-#define ALT_N 10
+// ===== 海拔滤波 + 校准 =====
+#define ALT_N 50
+#define ALT_CAL -30.0   // 校准偏移（GPS原始值 - 真实海拔）
 float altBuf[ALT_N]; int altI=0, altC=0;
 float filterAlt(float raw) {
   altBuf[altI]=raw; altI=(altI+1)%ALT_N; if(altC<ALT_N)altC++;
@@ -129,7 +145,10 @@ void loop() {
   while(Serial2.available()){
     if(gps.encode(Serial2.read())){
       if(gps.location.isValid()){lat=gps.location.lat();lng=gps.location.lng();fix=true;}
-      if(gps.altitude.isValid())alt=filterAlt(gps.altitude.meters());
+      if(gps.altitude.isValid()){
+        float raw=gps.altitude.meters() + ALT_CAL;  // 校准后海拔
+        alt=filterAlt(raw);
+      }
       if(gps.speed.isValid())spd=gps.speed.kmph();
       if(gps.satellites.isValid())sat=gps.satellites.value();
     }
