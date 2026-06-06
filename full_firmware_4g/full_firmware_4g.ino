@@ -52,6 +52,15 @@ void airPowerOn(){
   digitalWrite(AIR_PWR,HIGH);delay(1000);digitalWrite(AIR_PWR,LOW);delay(4000);
 }
 
+// Li-Ion 18650 真实放电曲线 (mV → %)
+int lipoPct(int mv){
+  if(mv>=4200)return 100;if(mv>=4100)return 92;if(mv>=4000)return 85;
+  if(mv>=3950)return 78;if(mv>=3900)return 70;if(mv>=3850)return 62;
+  if(mv>=3800)return 53;if(mv>=3750)return 42;if(mv>=3700)return 30;
+  if(mv>=3650)return 20;if(mv>=3600)return 12;if(mv>=3500)return 5;
+  if(mv>=3400)return 2;return 0;
+}
+
 bool init4G(){
   if(atCmd("AT",2000).indexOf("OK")>=0){Serial.println("4G already ON");}
   else{airPowerOn();}
@@ -61,9 +70,9 @@ bool init4G(){
   return atCmd("AT+CIFSR").indexOf(".")>0;
 }
 
-void httpReport(float la,float lo,float al,float sp,int sa){
+void httpReport(float la,float lo,float al,float sp,int sa,int ba){
   char url[250];
-  snprintf(url,sizeof(url),"GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1 HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n",la,lo,al,sp,sa);
+  snprintf(url,sizeof(url),"GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&rssi=%d HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n",la,lo,al,sp,sa,ba);
   Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
   String r=atCmd("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80",10000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
@@ -164,7 +173,8 @@ void loop(){
   // 电量
   int bat=0;
   {String cbc=atCmd("AT+CBC",2000);
-   int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=constrain(map(mv,3300,4200,0,100),0,100);}}
+   int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=lipoPct(mv);}}
+  static bool batAlert=false;if(bat<20&&!batAlert){batAlert=true;}if(bat>25)batAlert=false;
 
   // MQTT 电量（正常30s，LP 120s，DEEP 600s）
   static unsigned long lb=0;
@@ -178,7 +188,8 @@ void loop(){
   static unsigned long lp=0;
   if(fix&&millis()-lp>(deepSleep?300000:lowPower?60000:20000)){lp=millis();
     Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f\n",lat,lng,alt);
-    httpReport(lat,lng,alt,spd,sat);
+    httpReport(lat,lng,alt,spd,sat,bat);
+    if(bat<20){char aj[32];snprintf(aj,sizeof(aj),"{\"alert\":\"lowbat\",\"bat\":%d}",bat);mqttPublish("esp32/gps",aj);}
   }
   delay(50);
 }
