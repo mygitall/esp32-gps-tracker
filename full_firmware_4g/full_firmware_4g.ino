@@ -1,7 +1,8 @@
-// ESP32 GPS Tracker v2 — WiFi OTA + 电子围栏 + 低功耗
+// ESP32 GPS Tracker v3 — 健康监控 + 远程指令 + 夜间降频
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#define FW_VER "3.0"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -62,17 +63,35 @@ int lipoPct(int mv){
 }
 
 bool init4G(){
-  if(atCmd("AT",2000).indexOf("OK")>=0){Serial.println("4G already ON");}
-  else{airPowerOn();}
-  for(int i=0;i<10;i++){if(atCmd("AT",3000).indexOf("OK")>=0)break;delay(2000);}
-  if(atCmd("AT").indexOf("OK")<0)return false;
-  atCmd("AT+CGATT=1",5000);atCmd("AT+CSTT=\"UNINET\"");atCmd("AT+CIICR",8000);
-  return atCmd("AT+CIFSR").indexOf(".")>0;
+  // 自动 PWRKEY：每次开机固定触发，最多三次
+  for(int cycle=0;cycle<3;cycle++){
+    Serial.printf("PWRKEY 触发 (%d/3)...\n",cycle+1);
+    airPowerOn();  // GPIO27 HIGH → S8050导通 → PWRKEY拉低1秒
+    // 等 Air780EX 完全启动
+    delay(8000);
+    for(int i=0;i<10;i++){
+      String r=atCmd("AT",2000);
+      if(r.indexOf("OK")>=0){Serial.println("AT OK");goto ok;}
+      Serial.printf("  retry %d/10\n",i+1);
+      delay(1000);
+    }
+  }
+  Serial.println("AT FAIL");return false;
+  ok:
+  Serial.println("AT OK, init PDP...");
+  String r1=atCmd("AT+CSQ",2000); Serial.printf("CSQ:%s\n",r1.c_str());
+  String r2=atCmd("AT+CGATT=1",5000); Serial.printf("ATT:%s\n",r2.c_str());
+  String r3=atCmd("AT+CSTT=\"UNINET\"",2000); Serial.printf("STT:%s\n",r3.c_str());
+  String r4=atCmd("AT+CIICR",8000); Serial.printf("ICR:%s\n",r4.c_str());
+  String r5=atCmd("AT+CIFSR",2000); Serial.printf("IP:%s\n",r5.c_str());
+  return r5.indexOf(".")>0;
 }
 
 void httpReport(float la,float lo,float al,float sp,int sa,int ba){
-  char url[250];
-  snprintf(url,sizeof(url),"GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&rssi=%d HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n",la,lo,al,sp,sa,ba);
+  char url[350];
+  snprintf(url,sizeof(url),
+    "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&rssi=%d&ver=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n",
+    la,lo,al,sp,sa,ba,FW_VER,millis()/1000,ESP.getFreeHeap());
   Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
   String r=atCmd("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80",10000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
@@ -89,7 +108,7 @@ void mqttPublish(const char* topic,const char* payload){
   Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
   String r=atCmd("AT+CIPSTART=\"TCP\",\"broker.emqx.io\",1883",8000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
-  if(r.indexOf("CONNECT")<0)return;
+  if(r.indexOf("CONNECT")<0){Serial.println("MQTT TCP FAIL");return;}
   int tlen=strlen(topic),plen=strlen(payload);
   uint8_t conn[]={0x10,0x0E,0x00,0x04,'M','Q','T','T',0x04,0x02,0x00,0x1E,0x00,0x02,'g','p'};
   uint8_t pub[128];int pos=0;
@@ -157,6 +176,35 @@ void loop(){
     if(d<FENCE_RADIUS&&fenceAlert)fenceAlert=false;
   }
 
+  // ==== 夜间模式：22:00-6:00 降频 ====
+  bool nightMode=false;
+  if(gps.time.isValid()){
+    int h=(gps.time.hour()+8)%24; // UTC+8 北京时间
+    nightMode=(h>=22||h<6);
+  }
+
+  // ==== 远程指令轮询（每5分钟）====
+  static unsigned long lc=0;
+  if(millis()-lc>300000){lc=millis();
+    Serial1.print("AT+CIPSHUT\r\n");delay(300);while(Serial1.available())Serial1.read();
+    String r=atCmd("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80",8000);
+    if(r.indexOf("CONNECT")>=0){
+      while(Serial1.available())Serial1.read();
+      Serial1.print("AT+CIPSEND=70\r\n");delay(500);
+      String w;unsigned long t=millis();
+      while(millis()-t<3000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
+      if(w.indexOf(">")>=0){
+        Serial1.print("GET /esp32/mmq/cmd_api.php?device=esp32 HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n");
+        delay(2000);
+        String resp;while(Serial1.available())resp+=(char)Serial1.read();
+        if(resp.indexOf("\"reboot\"")>=0){Serial.println("CMD:reboot");ESP.restart();}
+        if(resp.indexOf("\"deep\"" )>=0){Serial.println("CMD:deep");nightMode=true;}
+        Serial.printf("CMD: %s\n",resp.substring(0,100).c_str());
+      }
+      Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();
+    }
+  }
+
   // ==== 低功耗：三级降频 ====
   bool idle=(spd<2.0);
   if(idle){if(lastMoveTime==0)lastMoveTime=millis();}
@@ -170,23 +218,29 @@ void loop(){
     else Serial.println("GPS: wait...");
   }
 
-  // 电量
-  int bat=0;
-  {String cbc=atCmd("AT+CBC",2000);
-   int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=lipoPct(mv);}}
+  // 电量（每30秒读一次，避免频繁AT命令）
+  static unsigned long bt=0; static int bat=0;
+  if(millis()-bt>30000){bt=millis();
+    atCmd("AT",1000); // 唤醒模块
+    String cbc=atCmd("AT+CBC",5000);
+    int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=lipoPct(mv);}
+  }
   static bool batAlert=false;if(bat<20&&!batAlert){batAlert=true;}if(bat>25)batAlert=false;
 
-  // MQTT 电量（正常30s，LP 120s，DEEP 600s）
+  // MQTT 电量（正常30s，LP 120s，DEEP 600s，夜间×2）
   static unsigned long lb=0;
-  if(millis()-lb>(deepSleep?600000:lowPower?120000:30000)){lb=millis();
+  int mqttIvl=deepSleep?600:lowPower?120:30; if(nightMode&&!lowPower)mqttIvl*=2;
+  if(millis()-lb>mqttIvl*1000){lb=millis();
     char bj[32];snprintf(bj,sizeof(bj),"{\"bat\":%d,\"fix\":%d}",bat,fix?1:0);
+    Serial.printf("BAT: %d%% %s%s\n",bat,deepSleep?"DEEP":lowPower?"LP":"",nightMode?" NIGHT":"");
     mqttPublish("esp32/gps",bj);
-    Serial.printf("BAT: %d%% %s\n",bat,deepSleep?"DEEP":lowPower?"LP":"");
+    Serial.println("MQTT done");
   }
 
-  // HTTP 上报（正常20s，LP 60s，DEEP 300s）
+  // HTTP 上报（正常20s，LP 60s，DEEP 300s，夜间×2）
   static unsigned long lp=0;
-  if(fix&&millis()-lp>(deepSleep?300000:lowPower?60000:20000)){lp=millis();
+  int httpIvl=deepSleep?300:lowPower?60:20; if(nightMode&&!lowPower)httpIvl*=2;
+  if(fix&&millis()-lp>httpIvl*1000){lp=millis();
     Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f\n",lat,lng,alt);
     httpReport(lat,lng,alt,spd,sat,bat);
     if(bat<20){char aj[32];snprintf(aj,sizeof(aj),"{\"alert\":\"lowbat\",\"bat\":%d}",bat);mqttPublish("esp32/gps",aj);}
