@@ -1,154 +1,103 @@
-// ESP32 + ATGM336H GPS + Air780EX 4G → MQTT
-// Air780EX: GPIO4(RX) GPIO5(TX) 115200baud PWRKEY手动
+// ESP32 + ATGM336H GPS + Air780EX 4G → HTTP API 直连
+// Air780EX: GPIO4(RX) GPIO5(TX) 115200baud GPIO27(PWRKEY)
 // GPS: GPIO16(RX) GPIO17(TX) 9600baud
 
 #include <TinyGPS++.h>
 
 #define AIR_RX 4
 #define AIR_TX 5
+#define AIR_PWR 27
 #define GPS_RX 16
 #define GPS_TX 17
+#define ALT_N 50
 
 TinyGPSPlus gps;
 float lat,lng,alt,spd; int sat; bool fix;
+float altBuf[ALT_N]; int altI=0,altC=0;
+
+float filterAlt(float raw){
+  altBuf[altI]=raw; altI=(altI+1)%ALT_N; if(altC<ALT_N)altC++;
+  float s=0; for(int i=0;i<altC;i++)s+=altBuf[i];
+  return s/altC;
+}
 
 // ===== AT 命令 =====
-String atCmd(const char* cmd, unsigned long to=3000) {
-  while(Serial1.available()) Serial1.read();
+String atCmd(const char* cmd, unsigned long to=3000){
+  while(Serial1.available())Serial1.read();
   Serial1.print(cmd); Serial1.print("\r\n");
   String r; unsigned long t=millis();
   while(millis()-t<to){if(Serial1.available())r+=(char)Serial1.read();delay(1);}
   return r;
 }
 
-// ===== TCP 发数据 =====
-bool tcpSend(const uint8_t* data, int len) {
-  while(Serial1.available()) Serial1.read();
-  Serial1.print("AT+CIPSEND="); Serial1.print(len); Serial1.print("\r\n");
-  String w; unsigned long t=millis();
-  while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-  if(w.indexOf(">")<0) return false;
-  Serial1.write(data,len);
-  delay(500);
-  return true;
-}
-
-// ===== 4G MQTT 发布 =====
-bool mqttPublish(const char* json) {
-  // 1. TCP
-  Serial1.print("AT+CIPSHUT\r\n"); delay(1000); while(Serial1.available())Serial1.read();
-
-  String r=atCmd("AT+CIPSTART=\"TCP\",\"broker.emqx.io\",1883",15000);
-  unsigned long t2=millis();
-  while(millis()-t2<8000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
-  if(r.indexOf("CONNECT")<0) return false;
-
-  // 2. MQTT CONNECT
-  const char* cid="esp32-4g-gps";
-  int cidlen=strlen(cid), rem=2+4+1+1+2+2+cidlen;
-  uint8_t conn[64]; int p=0;
-  conn[p++]=0x10; conn[p++]=rem;
-  conn[p++]=0x00;conn[p++]=0x04; conn[p++]='M';conn[p++]='Q';conn[p++]='T';conn[p++]='T';
-  conn[p++]=0x04; conn[p++]=0x02; conn[p++]=0x00;conn[p++]=0x1E;
-  conn[p++]=0x00;conn[p++]=cidlen; memcpy(conn+p,cid,cidlen); p+=cidlen;
-  if(!tcpSend(conn,p)) return false;
-
-  // 等 CONNACK
-  r=""; unsigned long t=millis();
-  while(millis()-t<8000){
-    while(Serial1.available())r+=(char)Serial1.read();
-    bool ok=false;
-    for(int i=0;i<(int)r.length()-3;i++){
-      if((uint8_t)r[i]==0x20&&(uint8_t)r[i+1]==0x02){ok=true;break;}
-    }
-    if(ok) break; delay(10);
-  }
-
-  // 3. MQTT PUBLISH
-  const char* topic="esp32/gps";
-  int tlen=strlen(topic),plen=strlen(json),prem=2+tlen+plen;
-  uint8_t pub[256]; p=0;
-  pub[p++]=0x30; pub[p++]=prem;
-  pub[p++]=0x00;pub[p++]=tlen; memcpy(pub+p,topic,tlen);p+=tlen;
-  memcpy(pub+p,json,plen);p+=plen;
-  if(!tcpSend(pub,p)) return false;
-
-  // 等 SEND OK
-  r=""; t=millis();
-  while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();delay(10);}
-  for(int i=0;i<(int)r.length()-6;i++){
-    if(r[i]=='S'&&r[i+1]=='E'&&r[i+2]=='N'&&r[i+3]=='D') return true;
-  }
-
-  // 关 TCP
-  Serial1.print("AT+CIPCLOSE\r\n"); delay(500);
-  while(Serial1.available())Serial1.read();
-  return false;
-}
-
-// ===== Air780EX PWRKEY 自动开机 =====
-#define AIR_PWR 27
-void airPowerOn() {
-  Serial.println("PWRKEY 开机...");
-  pinMode(AIR_PWR, OUTPUT);
-  digitalWrite(AIR_PWR, LOW);   // 默认低电平，三极管不导通
-  delay(500);
-  digitalWrite(AIR_PWR, HIGH);  // 高电平 → 三极管导通 → PWRKEY 拉低
-  delay(1500);                   // 保持 1.5 秒
-  digitalWrite(AIR_PWR, LOW);   // 释放
-  delay(5000);                   // 等 Air780EX 启动
-  Serial.println("PWRKEY 释放");
+// ===== PWRKEY =====
+void airPowerOn(){
+  pinMode(AIR_PWR,OUTPUT);
+  digitalWrite(AIR_PWR,LOW);delay(200);
+  digitalWrite(AIR_PWR,HIGH);delay(1000);
+  digitalWrite(AIR_PWR,LOW);delay(4000);
 }
 
 // ===== 4G 初始化 =====
-bool init4G() {
-  airPowerOn();
-
-  // 重试 AT
-  for(int i=0;i<5;i++){
-    if(atCmd("AT").indexOf("OK")>=0) break;
-    Serial.printf("retry %d\n",i+1);
-    delay(1000);
+bool init4G(){
+  if(atCmd("AT",2000).indexOf("OK")>=0){Serial.println("4G already ON");}
+  else{airPowerOn();}
+  for(int i=0;i<10;i++){
+    if(atCmd("AT",3000).indexOf("OK")>=0){Serial.println("AT OK");break;}
+    delay(2000);
   }
-  if(atCmd("AT").indexOf("OK")<0){Serial.println("AT FAIL");return false;}
+  if(atCmd("AT").indexOf("OK")<0)return false;
   atCmd("AT+CGATT=1",5000);
   atCmd("AT+CSTT=\"UNINET\"");
   atCmd("AT+CIICR",8000);
-  String ip=atCmd("AT+CIFSR");
-  Serial.print("4G IP: "); Serial.println(ip);
-  return ip.indexOf(".")>0;
+  return atCmd("AT+CIFSR").indexOf(".")>0;
 }
 
-// ===== 海拔滤波 + 校准 =====
-#define ALT_N 50
-#define ALT_CAL -30.0   // 校准偏移（GPS原始值 - 真实海拔）
-float altBuf[ALT_N]; int altI=0, altC=0;
-float filterAlt(float raw) {
-  altBuf[altI]=raw; altI=(altI+1)%ALT_N; if(altC<ALT_N)altC++;
-  float s=0; for(int i=0;i<altC;i++)s+=altBuf[i];
-  return s/altC;
+// ===== HTTP GET 上报 =====
+void httpReport(float la, float lo, float al, float sp, int sa){
+  char url[200];
+  snprintf(url,sizeof(url),"GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1 HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n",
+           la,lo,al,sp,sa);
+
+  Serial1.print("AT+CIPSHUT\r\n");delay(1000);
+  while(Serial1.available())Serial1.read();
+
+  String r=atCmd("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80",10000);
+  unsigned long t=millis();
+  while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
+
+  if(r.indexOf("CONNECT")<0){Serial1.print("AT+CIPCLOSE\r\n");delay(200);return;}
+
+  while(Serial1.available())Serial1.read();
+  Serial1.print("AT+CIPSEND=");Serial1.print(strlen(url));Serial1.print("\r\n");
+  String w; t=millis();
+  while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
+  if(w.indexOf(">")>=0){Serial1.print(url);delay(2000);}
+  Serial1.print("AT+CIPCLOSE\r\n");delay(200);
+  while(Serial1.available())Serial1.read();
+  Serial.println("HTTP OK");
 }
 
 // ===== 主程序 =====
-void setup() {
-  Serial.begin(115200); delay(500);
-  Serial.println("\n=== GPS 4G Tracker ===");
+void setup(){
+  Serial.begin(115200);delay(500);
+  Serial.println("\n=== GPS HTTP Tracker ===");
+  pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
-
-  if(init4G()) Serial.println("4G OK");
-  else Serial.println("4G FAIL");
+  Serial.println(init4G()?"4G OK":"4G FAIL");
 }
 
-void loop() {
+void loop(){
+  // 心跳闪灯
+  static unsigned long hb=0;
+  if(millis()-hb>1000){hb=millis();digitalWrite(2,HIGH);delay(30);digitalWrite(2,LOW);}
+
   // GPS
   while(Serial2.available()){
     if(gps.encode(Serial2.read())){
       if(gps.location.isValid()){lat=gps.location.lat();lng=gps.location.lng();fix=true;}
-      if(gps.altitude.isValid()){
-        float raw=gps.altitude.meters() + ALT_CAL;  // 校准后海拔
-        alt=filterAlt(raw);
-      }
+      if(gps.altitude.isValid())alt=filterAlt(gps.altitude.meters());
       if(gps.speed.isValid())spd=gps.speed.kmph();
       if(gps.satellites.isValid())sat=gps.satellites.value();
     }
@@ -156,39 +105,48 @@ void loop() {
 
   static unsigned long lg=0;
   if(millis()-lg>5000){lg=millis();
-    if(fix) Serial.printf("GPS: %.6f,%.6f sat=%d\n",lat,lng,sat);
+    if(fix)Serial.printf("GPS: %.6f,%.6f sat=%d alt=%.1f\n",lat,lng,sat,alt);
     else Serial.println("GPS: wait...");
   }
 
-  static unsigned long lp=0;
-  if(fix && millis()-lp>15000){lp=millis();
-    char json[128];
-    snprintf(json,sizeof(json),"{\"lat\":%.6f,\"lng\":%.6f,\"alt\":%.1f,\"spd\":%.1f,\"sat\":%d,\"fix\":1}",
-             lat,lng,alt,spd,sat);
+  // 读电量
+  int bat=0;
+  { String cbc=atCmd("AT+CBC",2000);
+    int p=cbc.indexOf("+CBC:"); if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=constrain(map(mv,3300,4200,0,100),0,100);}
+  }
 
-    // 1. MQTT
-    Serial.printf("MQTT>> %s\n",json);
-    mqttPublish(json);
-
-    // 2. HTTP POST
-    String post="api_key=esp32&data="+String(json);
-    Serial1.print("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80\r\n");
-    String r; unsigned long t=millis();
-    while(millis()-t<8000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
+  // 每 30 秒 MQTT 电量心跳
+  static unsigned long lb=0;
+  if(millis()-lb>30000){lb=millis();
+    char bj[32];snprintf(bj,sizeof(bj),"{\"bat\":%d,\"fix\":%d}",bat,fix?1:0);
+    // 简易 MQTT publish (单次 TCP)
+    Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
+    String r=atCmd("AT+CIPSTART=\"TCP\",\"broker.emqx.io\",1883",8000);
+    unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
     if(r.indexOf("CONNECT")>=0){
-      String http="POST /esp32/mmq/api.php HTTP/1.1\r\nHost: www.sseeee.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ";
-      http += String(post.length());
-      http += "\r\nConnection: close\r\n\r\n";
-      http += post;
+      uint8_t conn[]={0x10,0x0E,0x00,0x04,'M','Q','T','T',0x04,0x02,0x00,0x1E,0x00,0x02,'g','p'}; // CONNECT (rem=14)
+      int tlen=strlen("esp32/gps"),plen=strlen(bj);
+      uint8_t pub[64];int pos=0;
+      pub[pos++]=0x30;pub[pos++]=2+tlen+plen;pub[pos++]=0x00;pub[pos++]=tlen;
+      memcpy(pub+pos,"esp32/gps",tlen);pos+=tlen;memcpy(pub+pos,bj,plen);pos+=plen;
       while(Serial1.available())Serial1.read();
-      Serial1.print("AT+CIPSEND="); Serial1.print(http.length()); Serial1.print("\r\n");
-      String w; t=millis();
-      while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-      if(w.indexOf(">")>=0){Serial1.print(http);delay(2000);}
-      Serial1.print("AT+CIPCLOSE\r\n");delay(500);
+      Serial1.print("AT+CIPSEND=");Serial1.print(sizeof(conn));Serial1.print("\r\n");
+      String w;t=millis();while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
+      if(w.indexOf(">")>=0){Serial1.write(conn,sizeof(conn));delay(500);}
       while(Serial1.available())Serial1.read();
-      Serial.println("HTTP OK");
+      Serial1.print("AT+CIPSEND=");Serial1.print(pos);Serial1.print("\r\n");
+      w="";t=millis();while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
+      if(w.indexOf(">")>=0){Serial1.write(pub,pos);delay(500);}
+      Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();
+      Serial.println("BAT MQTT OK");
     }
+  }
+
+  // 每 20 秒 HTTP 上报 GPS
+  static unsigned long lp=0;
+  if(fix && millis()-lp>20000){lp=millis();
+    Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f bat=%d\n",lat,lng,alt,bat);
+    httpReport(lat,lng,alt,spd,sat);
   }
   delay(50);
 }
