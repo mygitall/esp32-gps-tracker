@@ -1,8 +1,9 @@
-// ESP32 GPS Tracker v3.2 — 数据完整性 + MQTT坐标 + TCP复用 + CSQ上报
+// ESP32 GPS Tracker v3.3 — 看门狗 + 4G自动重连 + 内存优化
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "3.2"
+#include <esp_task_wdt.h>
+#define FW_VER "3.3"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -29,6 +30,8 @@ unsigned long lastMoveTime=0;
 int bat=-1; bool batReady=false;  // -1=待读, batReady=已成功读过
 int csq=0;                        // 4G 信号质量 (0-31)
 char tcpHost[32]=""; int tcpPort=0; // TCP 复用状态
+bool g4ok=false;                   // 4G 是否已连接
+unsigned long last4gRetry=0;       // 上次重连尝试时间
 
 float filterAlt(float raw){
   altBuf[altI]=raw; altI=(altI+1)%ALT_N; if(altC<ALT_N)altC++;
@@ -165,10 +168,15 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.2 ===");
+  Serial.println("\n=== GPS Tracker v3.3 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
+
+  // 看门狗：60 秒超时，防止死锁
+  esp_task_wdt_config_t wdtCfg = { .timeout_ms = 60000 };
+  esp_task_wdt_init(&wdtCfg);
+  esp_task_wdt_add(NULL);
 
   WiFi.begin(WIFI_SSID,WIFI_PASS);
   int w=0;while(WiFi.status()!=WL_CONNECTED&&w++<8){delay(500);Serial.print(".");}
@@ -179,14 +187,24 @@ void setup(){
     Serial.println("OTA ready");
   }else{Serial.println("\nWiFi fail, 4G only");}
 
-  if(init4G()){
+  g4ok = init4G();
+  if(g4ok){
     Serial.println("4G OK");
-    readBattery(); // 启动时立即读一次电量，避免首发数据 bat=0
+    readBattery();
   }else{Serial.println("4G FAIL");}
 }
 
 void loop(){
+  esp_task_wdt_reset(); // 喂狗
   if(wifiOn)ArduinoOTA.handle();
+
+  // ==== 4G 自动重连 ====
+  if(!g4ok && millis()-last4gRetry>120000){ // 每2分钟重试
+    last4gRetry=millis();
+    Serial.println("Retry 4G...");
+    g4ok=init4G();
+    if(g4ok){Serial.println("4G recovered!");readBattery();}
+  }
 
   static unsigned long hb=0;
   if(millis()-hb>1000){hb=millis();digitalWrite(2,HIGH);delay(30);digitalWrite(2,LOW);}
