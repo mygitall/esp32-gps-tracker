@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v3.9 — 电量平滑 + 电压mV显示
+// ESP32 GPS Tracker v4.0 — PDP掉线自动恢复
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "3.9"
+#define FW_VER "4.0"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -91,8 +91,13 @@ bool tcpConnect(const char* host, int port){
   snprintf(cmd,sizeof(cmd),"AT+CIPSTART=\"TCP\",\"%s\",%d",host,port);
   String r=atCmd(cmd,10000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
-  if(r.indexOf("CONNECT")<0){Serial.printf("TCP FAIL %s:%d\n",host,port);return false;}
-  strncpy(tcpHost,host,31);tcpHost[31]=0; // 确保 null 终止
+  if(r.indexOf("CONNECT")<0){
+    Serial.printf("TCP FAIL %s:%d\n",host,port);
+    static int tcpFailCnt=0;
+    if(++tcpFailCnt>=3){tcpFailCnt=0;g4ok=false;Serial.println("TCP fails→reset g4ok");}
+    return false;
+  }
+  strncpy(tcpHost,host,31);tcpHost[31]=0;
   tcpPort=port;tcpConnTime=millis();
   return true;
 }
@@ -198,7 +203,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.9 ===");
+  Serial.println("\n=== GPS Tracker v4.0 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
@@ -222,9 +227,10 @@ void setup(){
 void loop(){
   if(wifiOn)ArduinoOTA.handle();
 
-  // ==== 4G 自动重连 ====
+  // ==== 4G 自动重连：连续 TCP 失败 3 次或定时重试 ====
+  static int tcpFails=0;
   if(!g4ok && millis()-last4gRetry>120000){ // 每2分钟重试
-    last4gRetry=millis();
+    last4gRetry=millis();tcpFails=0;
     Serial.println("Retry 4G...");
     g4ok=init4G();
     if(g4ok){Serial.println("4G recovered!");readBattery();}
