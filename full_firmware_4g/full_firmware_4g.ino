@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v3.6 — 内存安全 + CONNACK校验 + 连接超时
+// ESP32 GPS Tracker v3.7 — 电量分辨率提升至20mV
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "3.6"
+#define FW_VER "3.7"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -60,11 +60,20 @@ void airPowerOn(){
 }
 
 int lipoPct(int mv){
-  if(mv>=4200)return 100;if(mv>=4100)return 92;if(mv>=4000)return 85;
-  if(mv>=3950)return 78;if(mv>=3900)return 70;if(mv>=3850)return 62;
-  if(mv>=3800)return 53;if(mv>=3750)return 42;if(mv>=3700)return 30;
-  if(mv>=3650)return 20;if(mv>=3600)return 12;if(mv>=3500)return 5;
-  if(mv>=3400)return 2;return 0;
+  // 20mV 一档，更灵敏反映真实放电曲线
+  if(mv>=4200)return 100;if(mv>=4180)return 98;if(mv>=4160)return 95;
+  if(mv>=4140)return 92;if(mv>=4120)return 89;if(mv>=4100)return 86;
+  if(mv>=4080)return 83;if(mv>=4060)return 80;if(mv>=4040)return 77;
+  if(mv>=4020)return 74;if(mv>=4000)return 71;if(mv>=3980)return 68;
+  if(mv>=3960)return 65;if(mv>=3940)return 62;if(mv>=3920)return 59;
+  if(mv>=3900)return 56;if(mv>=3880)return 53;if(mv>=3860)return 50;
+  if(mv>=3840)return 47;if(mv>=3820)return 44;if(mv>=3800)return 41;
+  if(mv>=3780)return 38;if(mv>=3760)return 35;if(mv>=3740)return 32;
+  if(mv>=3720)return 29;if(mv>=3700)return 26;if(mv>=3680)return 23;
+  if(mv>=3660)return 20;if(mv>=3640)return 17;if(mv>=3620)return 14;
+  if(mv>=3600)return 11;if(mv>=3580)return 8;if(mv>=3560)return 6;
+  if(mv>=3540)return 4;if(mv>=3520)return 3;if(mv>=3500)return 2;
+  if(mv>=3400)return 1;return 0;
 }
 
 // ===== TCP 连接复用 =====
@@ -183,7 +192,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.6 ===");
+  Serial.println("\n=== GPS Tracker v3.7 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
