@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v4.0 — PDP掉线自动恢复
+// ESP32 GPS Tracker v4.3 — PDP保活:已激活时跳过CSTT/CIICR
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "4.0"
+#define FW_VER "4.3"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -104,11 +104,21 @@ bool tcpConnect(const char* host, int port){
 
 // ===== 4G 初始化 =====
 bool init4G(){
-  // 先探测模块是否已开机（OTA 重启场景），避免误关
+  // 先探测模块是否已开机，并检查 PDP 是否有效
   Serial1.print("AT\r\n");delay(500);
   String pre=atCmd("AT",2000);
-  if(pre.indexOf("OK")>=0){Serial.println("4G already ON");goto pdp;}
-  // 模块未开机，PWRKEY 触发
+  if(pre.indexOf("OK")>=0){
+    Serial.println("4G already ON, check PDP...");
+    String ip=atCmd("AT+CIFSR",3000);
+    if(ip.indexOf(".")>0){Serial.println("PDP OK");goto pdp;}
+    Serial.println("PDP dead, reset module...");
+    // PDP 失效，PWRKEY 关机再开机
+    airPowerOn();delay(8000);
+    for(int i=0;i<10;i++){String r=atCmd("AT",2000);if(r.indexOf("OK")>=0)goto pdp;delay(1000);}
+    Serial.println("Reset fail");
+    // 继续走 PWRKEY 循环
+  }
+  // 模块未开机或复位失败，PWRKEY 触发
   for(int cycle=0;cycle<3;cycle++){
     Serial.printf("PWRKEY (%d/3)...\n",cycle+1);
     airPowerOn();
@@ -122,15 +132,22 @@ bool init4G(){
   }
   Serial.println("AT FAIL");return false;
   pdp:
-  Serial.println("AT OK, init PDP...");
+  Serial.println("PDP init...");
   String r1=atCmd("AT+CSQ",2000);
   int p=r1.indexOf("+CSQ:");if(p>=0)csq=r1.substring(p+5).toInt();
   Serial.printf("CSQ:%d\n",csq);
-  String r2=atCmd("AT+CGATT=1",5000); Serial.printf("ATT:%s\n",r2.c_str());
-  String r3=atCmd("AT+CSTT=\"UNINET\"",2000); Serial.printf("STT:%s\n",r3.c_str());
-  String r4=atCmd("AT+CIICR",8000); Serial.printf("ICR:%s\n",r4.c_str());
-  String r5=atCmd("AT+CIFSR",2000); Serial.printf("IP:%s\n",r5.c_str());
-  return r5.indexOf(".")>0;
+  // 先查是否已有 IP（PDP 可能已激活）
+  String ip=atCmd("AT+CIFSR",3000);
+  if(ip.indexOf(".")>0){Serial.printf("IP reuse:%s\n",ip.c_str());return true;}
+  // 无 IP，完整激活 PDP
+  atCmd("AT+CGATT=1",5000);
+  atCmd("AT+CSTT=\"UNINET\"",2000);
+  atCmd("AT+CIICR",8000);
+  ip=atCmd("AT+CIFSR",3000);
+  delay(500);
+  String ip2=atCmd("AT+CIFSR",3000);
+  Serial.printf("IP1:%s IP2:%s\n",ip.c_str(),ip2.c_str());
+  return ip.indexOf(".")>0 || ip2.indexOf(".")>0;
 }
 
 // ===== HTTP 上报 =====
@@ -203,7 +220,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v4.0 ===");
+  Serial.println("\n=== GPS Tracker v4.3 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
