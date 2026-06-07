@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v3.5 — 数据可靠性 + 围栏持续告警
+// ESP32 GPS Tracker v3.6 — 内存安全 + CONNACK校验 + 连接超时
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "3.5"
+#define FW_VER "3.6"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -29,6 +29,7 @@ unsigned long lastMoveTime=0;
 int bat=-1; bool batReady=false;  // -1=待读, batReady=已成功读过
 int csq=0;                        // 4G 信号质量 (0-31)
 char tcpHost[32]=""; int tcpPort=0; // TCP 复用状态
+unsigned long tcpConnTime=0;       // TCP 连接建立时间，用于超时重连
 bool g4ok=false;                   // 4G 是否已连接
 unsigned long last4gRetry=0;       // 上次重连尝试时间
 
@@ -68,17 +69,19 @@ int lipoPct(int mv){
 
 // ===== TCP 连接复用 =====
 bool tcpConnect(const char* host, int port){
-  if(strcmp(tcpHost,host)==0 && tcpPort==port) return true; // 已连接，复用
+  // 复用检查：相同主机端口且连接未超过 5 分钟
+  if(strcmp(tcpHost,host)==0 && tcpPort==port && millis()-tcpConnTime<300000) return true;
   // 关闭旧连接
   if(tcpHost[0]){Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();}
-  tcpHost[0]=0; tcpPort=0;
+  tcpHost[0]=0; tcpPort=0; tcpConnTime=0;
   Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
   char cmd[64];
   snprintf(cmd,sizeof(cmd),"AT+CIPSTART=\"TCP\",\"%s\",%d",host,port);
   String r=atCmd(cmd,10000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
   if(r.indexOf("CONNECT")<0){Serial.printf("TCP FAIL %s:%d\n",host,port);return false;}
-  strncpy(tcpHost,host,31);tcpPort=port;
+  strncpy(tcpHost,host,31);tcpHost[31]=0; // 确保 null 终止
+  tcpPort=port;tcpConnTime=millis();
   return true;
 }
 
@@ -132,27 +135,33 @@ void httpReport(float la,float lo,float al,float sp,int sa,int ba){
 
 // ===== MQTT 发布（含 GPS 坐标 + CSQ）=====
 void mqttPublish(const char* topic,const char* payload){
-  if(!tcpConnect("broker.emqx.io",1883))return;
+  if(!tcpConnect("broker.emqx.io",1883)){Serial.println("MQTT TCP FAIL");return;}
   int tlen=strlen(topic),plen=strlen(payload);
   uint8_t conn[]={0x10,0x0E,0x00,0x04,'M','Q','T','T',0x04,0x02,0x00,0x1E,0x00,0x02,'g','p'};
-  uint8_t pub[192];int pos=0;
+  uint8_t pub[256];int pos=0;
   int rem=2+tlen+plen;
+  if(pos+rem+4>256){Serial.println("MQTT overflow");return;}
   pub[pos++]=0x30;
-  do{uint8_t b=rem%128;rem/=128;if(rem)b|=0x80;pub[pos++]=b;}while(rem); // VLE
+  do{uint8_t b=rem%128;rem/=128;if(rem)b|=0x80;pub[pos++]=b;}while(rem);
   pub[pos++]=0x00;pub[pos++]=tlen;
   memcpy(pub+pos,topic,tlen);pos+=tlen;memcpy(pub+pos,payload,plen);pos+=plen;
+  // 发 CONNECT
   while(Serial1.available())Serial1.read();
   Serial1.print("AT+CIPSEND=");Serial1.print(sizeof(conn));Serial1.print("\r\n");
   String w;unsigned long t=millis();
   while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-  if(w.indexOf(">")>=0){Serial1.write(conn,sizeof(conn));delay(500);
-    // 等 CONNACK
-    String ca;t=millis();while(millis()-t<5000){while(Serial1.available())ca+=(char)Serial1.read();if(ca.length()>=4)break;delay(10);}
-    while(Serial1.available())Serial1.read();
-  }
+  if(w.indexOf(">")<0){Serial.println("MQTT NO >");return;}
+  Serial1.write(conn,sizeof(conn));delay(500);
+  // 等 CONNACK 并校验返回码
+  String ca;t=millis();bool connOk=false;
+  while(millis()-t<5000){while(Serial1.available())ca+=(char)Serial1.read();if(ca.length()>=4){connOk=((uint8_t)ca[0]==0x20&&(uint8_t)ca[1]==0x02&&(uint8_t)ca[3]==0x00);break;}delay(10);}
+  while(Serial1.available())Serial1.read();
+  if(!connOk){Serial.println("MQTT CONN FAIL");return;}
+  // 发 PUBLISH
   Serial1.print("AT+CIPSEND=");Serial1.print(pos);Serial1.print("\r\n");
   w="";t=millis();while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-  if(w.indexOf(">")>=0){Serial1.write(pub,pos);delay(300);}
+  if(w.indexOf(">")<0){Serial.println("MQTT PUB NO >");return;}
+  Serial1.write(pub,pos);delay(300);
   Serial.println("MQTT OK");
 }
 
@@ -174,7 +183,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.5 ===");
+  Serial.println("\n=== GPS Tracker v3.6 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
@@ -288,15 +297,11 @@ void loop(){
         bat,lat,lng,spd,alt,sat,csq);
       Serial.printf("MQTT>> %s\n",bj);
       mqttPublish("esp32/gps",bj);
-    }else{
-      char bj[64];
-      snprintf(bj,sizeof(bj),"{\"bat\":%d,\"fix\":0,\"csq\":%d}",bat,csq);
-      mqttPublish("esp32/gps",bj);
-    }
-    // 低电量告警（仅当已成功读过电量）
-    if(batReady && bat>0 && bat<20){
-      char aj[48];snprintf(aj,sizeof(aj),"{\"alert\":\"lowbat\",\"bat\":%d}",bat);
-      mqttPublish("esp32/gps",aj);
+      // 低电量告警（bat 已在 payload 中，仅额外标注 alert 字段）
+      if(batReady && bat>0 && bat<20){
+        char aj[64];snprintf(aj,sizeof(aj),"{\"bat\":%d,\"alert\":\"lowbat\",\"lat\":%.6f,\"lng\":%.6f}",bat,lat,lng);
+        mqttPublish("esp32/gps",aj);
+      }
     }
   }
 
