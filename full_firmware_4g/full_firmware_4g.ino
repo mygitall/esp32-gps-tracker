@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v3.4 — 4G自动重连 + 服务端GPS存储修复
+// ESP32 GPS Tracker v3.5 — 数据可靠性 + 围栏持续告警
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "3.4"
+#define FW_VER "3.5"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -124,8 +124,10 @@ void httpReport(float la,float lo,float al,float sp,int sa,int ba){
   Serial1.print("AT+CIPSEND=");Serial1.print(strlen(url));Serial1.print("\r\n");
   String w;unsigned long t=millis();
   while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-  if(w.indexOf(">")>=0){Serial1.print(url);delay(2000);}
-  Serial.println("HTTP OK");
+  if(w.indexOf(">")>=0){Serial1.print(url);delay(2000);
+    String ok;t=millis();while(millis()-t<3000){while(Serial1.available())ok+=(char)Serial1.read();if(ok.indexOf("SEND OK")>=0||ok.indexOf("ERROR")>=0)break;delay(10);}
+    Serial.println(ok.indexOf("SEND OK")>=0?"HTTP OK":"HTTP FAIL");
+  }else{Serial.println("HTTP NO >");}
 }
 
 // ===== MQTT 发布（含 GPS 坐标 + CSQ）=====
@@ -143,7 +145,11 @@ void mqttPublish(const char* topic,const char* payload){
   Serial1.print("AT+CIPSEND=");Serial1.print(sizeof(conn));Serial1.print("\r\n");
   String w;unsigned long t=millis();
   while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-  if(w.indexOf(">")>=0){Serial1.write(conn,sizeof(conn));delay(300);while(Serial1.available())Serial1.read();}
+  if(w.indexOf(">")>=0){Serial1.write(conn,sizeof(conn));delay(500);
+    // 等 CONNACK
+    String ca;t=millis();while(millis()-t<5000){while(Serial1.available())ca+=(char)Serial1.read();if(ca.length()>=4)break;delay(10);}
+    while(Serial1.available())Serial1.read();
+  }
   Serial1.print("AT+CIPSEND=");Serial1.print(pos);Serial1.print("\r\n");
   w="";t=millis();while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
   if(w.indexOf(">")>=0){Serial1.write(pub,pos);delay(300);}
@@ -154,20 +160,21 @@ void mqttPublish(const char* topic,const char* payload){
 void readBattery(){
   Serial1.print("AT\r\n");delay(300);while(Serial1.available())Serial1.read();
   String cbc=atCmd("AT+CBC",5000);
-  int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0){bat=lipoPct(mv);batReady=true;}}
-  Serial.printf("CBC → %dmV bat=%d%%\n",batReady?bat:-1,bat);
+  int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0){bat=lipoPct(mv);batReady=true;}
+    Serial.printf("CBC → %dmV bat=%d%%\n",mv,bat);
+  }else{Serial.printf("CBC fail: %s\n",cbc.substring(0,20).c_str());}
 }
 
 // ===== 读信号 =====
 void readCsq(){
   String r=atCmd("AT+CSQ",2000);
-  int p=r.indexOf("+CSQ:");if(p>=0)csq=r.substring(p+5).toInt();
+  int p=r.indexOf("+CSQ:");if(p>=0){int v=r.substring(p+5).toInt();if(v>=0&&v<=31)csq=v;}
 }
 
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.4 ===");
+  Serial.println("\n=== GPS Tracker v3.5 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
@@ -213,15 +220,18 @@ void loop(){
   }
 
   // ==== 电子围栏 ====
+  static unsigned long lastFenceAlert=0;
   if(fix){
     float d=distKm(HOME_LAT,HOME_LNG,lat,lng);
-    if(d>FENCE_RADIUS&&!fenceAlert){
-      fenceAlert=true;
-      char fj[96];snprintf(fj,sizeof(fj),"{\"alert\":\"fence\",\"dist\":%.0f,\"lat\":%.6f,\"lng\":%.6f}",d,lat,lng);
-      mqttPublish("esp32/gps",fj);
-      Serial.printf("FENCE! %.0fm\n",d);
+    if(d>FENCE_RADIUS){
+      if(!fenceAlert||millis()-lastFenceAlert>300000){ // 首次或每5分钟重告
+        fenceAlert=true;lastFenceAlert=millis();
+        char fj[96];snprintf(fj,sizeof(fj),"{\"alert\":\"fence\",\"dist\":%.0f,\"lat\":%.6f,\"lng\":%.6f}",d,lat,lng);
+        mqttPublish("esp32/gps",fj);
+        Serial.printf("FENCE! %.0fm\n",d);
+      }
     }
-    if(d<FENCE_RADIUS&&fenceAlert)fenceAlert=false;
+    if(d<FENCE_RADIUS&&fenceAlert){fenceAlert=false;lastFenceAlert=0;}
   }
 
   // ==== 夜间模式 ====
