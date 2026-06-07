@@ -82,19 +82,24 @@ bool tcpConnect(const char* host, int port){
 
 // ===== 4G 初始化 =====
 bool init4G(){
+  // 先探测模块是否已开机（OTA 重启场景），避免误关
+  Serial1.print("AT\r\n");delay(500);
+  String pre=atCmd("AT",2000);
+  if(pre.indexOf("OK")>=0){Serial.println("4G already ON");goto pdp;}
+  // 模块未开机，PWRKEY 触发
   for(int cycle=0;cycle<3;cycle++){
     Serial.printf("PWRKEY (%d/3)...\n",cycle+1);
     airPowerOn();
     delay(8000);
     for(int i=0;i<10;i++){
       String r=atCmd("AT",2000);
-      if(r.indexOf("OK")>=0){Serial.println("AT OK");goto ok;}
+      if(r.indexOf("OK")>=0){Serial.println("AT OK");goto pdp;}
       Serial.printf("  retry %d/10\n",i+1);
       delay(1000);
     }
   }
   Serial.println("AT FAIL");return false;
-  ok:
+  pdp:
   Serial.println("AT OK, init PDP...");
   String r1=atCmd("AT+CSQ",2000);
   int p=r1.indexOf("+CSQ:");if(p>=0)csq=r1.substring(p+5).toInt();
