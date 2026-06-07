@@ -1,9 +1,8 @@
-// ESP32 GPS Tracker v3.3 — 看门狗 + 4G自动重连 + 内存优化
+// ESP32 GPS Tracker v3.4 — 4G自动重连 + 服务端GPS存储修复
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#include <esp_task_wdt.h>
-#define FW_VER "3.3"
+#define FW_VER "3.4"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -168,15 +167,10 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.3 ===");
+  Serial.println("\n=== GPS Tracker v3.4 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
-
-  // 看门狗：60 秒超时，防止死锁
-  esp_task_wdt_config_t wdtCfg = { .timeout_ms = 60000 };
-  esp_task_wdt_init(&wdtCfg);
-  esp_task_wdt_add(NULL);
 
   WiFi.begin(WIFI_SSID,WIFI_PASS);
   int w=0;while(WiFi.status()!=WL_CONNECTED&&w++<8){delay(500);Serial.print(".");}
@@ -195,7 +189,6 @@ void setup(){
 }
 
 void loop(){
-  esp_task_wdt_reset(); // 喂狗
   if(wifiOn)ArduinoOTA.handle();
 
   // ==== 4G 自动重连 ====
