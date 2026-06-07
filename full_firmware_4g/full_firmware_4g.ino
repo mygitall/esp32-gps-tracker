@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v3.7 — 电量分辨率提升至20mV
+// ESP32 GPS Tracker v3.8 — 电量平滑过渡 + 20mV分辨率
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "3.7"
+#define FW_VER "3.8"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -27,6 +27,8 @@ bool wifiOn=false, fenceAlert=false;
 unsigned long lastMoveTime=0;
 
 int bat=-1; bool batReady=false;  // -1=待读, batReady=已成功读过
+int targetBat=-1,displayBat=-1;    // 目标值 + 平滑显示值
+unsigned long lastBatSmooth=0;     // 平滑计时
 int csq=0;                        // 4G 信号质量 (0-31)
 char tcpHost[32]=""; int tcpPort=0; // TCP 复用状态
 unsigned long tcpConnTime=0;       // TCP 连接建立时间，用于超时重连
@@ -178,9 +180,12 @@ void mqttPublish(const char* topic,const char* payload){
 void readBattery(){
   Serial1.print("AT\r\n");delay(300);while(Serial1.available())Serial1.read();
   String cbc=atCmd("AT+CBC",5000);
-  int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0){bat=lipoPct(mv);batReady=true;}
-    Serial.printf("CBC → %dmV bat=%d%%\n",mv,bat);
-  }else{Serial.printf("CBC fail: %s\n",cbc.substring(0,20).c_str());}
+  int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0){
+    targetBat=lipoPct(mv);batReady=true;
+    if(displayBat<0)displayBat=targetBat; // 首次直接同步
+    Serial.printf("CBC → %dmV target=%d%% display=%d%%\n",mv,targetBat,displayBat);
+  }}else{Serial.printf("CBC fail: %s\n",cbc.substring(0,20).c_str());}
+  bat=displayBat; // 对外仍用 bat，但值是平滑后的
 }
 
 // ===== 读信号 =====
@@ -192,7 +197,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v3.7 ===");
+  Serial.println("\n=== GPS Tracker v3.8 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
@@ -226,6 +231,13 @@ void loop(){
 
   static unsigned long hb=0;
   if(millis()-hb>1000){hb=millis();digitalWrite(2,HIGH);delay(30);digitalWrite(2,LOW);}
+
+  // ==== 电量平滑：每秒向目标靠近 1% ====
+  if(batReady && displayBat!=targetBat && millis()-lastBatSmooth>1000){
+    lastBatSmooth=millis();
+    displayBat+=(targetBat>displayBat)?1:-1;
+    bat=displayBat;
+  }
 
   // GPS
   while(Serial2.available()){
