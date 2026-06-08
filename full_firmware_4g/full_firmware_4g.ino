@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v4.3 — PDP保活:已激活时跳过CSTT/CIICR
+// ESP32 GPS Tracker v4.4 — 正常模式5s高频上报
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "4.3"
+#define FW_VER "4.4"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -220,7 +220,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v4.3 ===");
+  Serial.println("\n=== GPS Tracker v4.4 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
@@ -322,8 +322,8 @@ void loop(){
   bool lowPower=(idle&&millis()-lastMoveTime>60000);
 
   // 上报间隔
-  int httpIvl=deepSleep?300:lowPower?60:20; if(nightMode&&!lowPower)httpIvl*=2;
-  int mqttIvl=deepSleep?600:lowPower?120:30; if(nightMode&&!lowPower)mqttIvl*=2;
+  int httpIvl=deepSleep?300:lowPower?60:5; if(nightMode&&!lowPower)httpIvl*=2;
+  int mqttIvl=deepSleep?600:lowPower?120:5; if(nightMode&&!lowPower)mqttIvl*=2;
 
   static unsigned long lg=0;
   if(millis()-lg>(deepSleep?30000:lowPower?15000:5000)){lg=millis();
