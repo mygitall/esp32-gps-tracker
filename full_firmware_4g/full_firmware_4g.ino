@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v4.4 — 正常模式5s高频上报
+// ESP32 GPS Tracker v7.0 — 纯HTTP批量上报，关闭MQTT
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "4.4"
+#define FW_VER "7.0"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -21,10 +21,16 @@ const double HOME_LNG = 121.805200;
 const float FENCE_RADIUS = 500.0;
 
 TinyGPSPlus gps;
-float lat,lng,alt,spd; int sat; bool fix;
+double lat,lng; float alt,spd; int sat; bool fix;
 float altBuf[ALT_N]; int altI=0,altC=0;
 bool wifiOn=false, fenceAlert=false;
 unsigned long lastMoveTime=0;
+double lastMoveLat=0,lastMoveLng=0;  // 用于位置变化检测
+
+// GPS 批处理缓冲区
+#define BUF_MAX 10
+struct GpsPt {double la,lo; float al; int sp,sat,bt,mv,cs;};
+GpsPt buf[BUF_MAX]; int bufN=0;
 
 int bat=-1; bool batReady=false;  // -1=待读, batReady=已成功读过
 int targetBat=-1,displayBat=-1;    // 目标值 + 平滑显示值
@@ -156,8 +162,8 @@ void httpReport(float la,float lo,float al,float sp,int sa,int ba){
   while(Serial1.available())Serial1.read();
   char url[400];
   snprintf(url,sizeof(url),
-    "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&rssi=%d&mv=%d&csq=%d&ver=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: keep-alive\r\n\r\n",
-    la,lo,al,sp,sa,ba,battMv,csq,FW_VER,millis()/1000,ESP.getFreeHeap());
+    "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&rssi=%d&mv=%d&csq=%d&ver=%s&uptime=%lu&heap=%u&_=%lu HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n",
+    la,lo,al,sp,sa,ba,battMv,csq,FW_VER,millis()/1000,ESP.getFreeHeap(),millis());
   Serial1.print("AT+CIPSEND=");Serial1.print(strlen(url));Serial1.print("\r\n");
   String w;unsigned long t=millis();
   while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
@@ -165,6 +171,36 @@ void httpReport(float la,float lo,float al,float sp,int sa,int ba){
     String ok;t=millis();while(millis()-t<3000){while(Serial1.available())ok+=(char)Serial1.read();if(ok.indexOf("SEND OK")>=0||ok.indexOf("ERROR")>=0)break;delay(10);}
     Serial.println(ok.indexOf("SEND OK")>=0?"HTTP OK":"HTTP FAIL");
   }else{Serial.println("HTTP NO >");}
+  // HTTP 用 close，发完断开 TCP，避免干扰 MQTT
+  Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();
+  tcpHost[0]=0;tcpPort=0;
+}
+
+// ===== 批量 GET 上报（简单可靠）=====
+void httpFlush(){
+  if(bufN==0)return;
+  if(!tcpConnect("www.sseeee.com",80)){bufN=0;return;}
+  while(Serial1.available())Serial1.read();
+  // 用 GET URL 参数拼接多条记录
+  String url="GET /esp32/mmq/receiver.php?batch=";
+  for(int i=0;i<bufN;i++){
+    if(i>0)url+="|";
+    char pt[96];
+    snprintf(pt,sizeof(pt),"%.6f,%.6f,%.1f,%d,%d,%d,%d,%d",
+      (float)buf[i].la,(float)buf[i].lo,buf[i].al,buf[i].sp,buf[i].sat,buf[i].bt,buf[i].mv,buf[i].cs);
+    url+=pt;
+  }
+  url+=" HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n";
+  bufN=0;
+  Serial1.print("AT+CIPSEND=");Serial1.print(url.length());Serial1.print("\r\n");
+  String w;unsigned long t=millis();
+  while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
+  if(w.indexOf(">")>=0){Serial1.print(url);delay(2000);
+    String ok;t=millis();while(millis()-t<3000){while(Serial1.available())ok+=(char)Serial1.read();if(ok.indexOf("SEND OK")>=0||ok.indexOf("ERROR")>=0)break;delay(10);}
+    Serial.printf("FLUSH %s\n",ok.indexOf("SEND OK")>=0?"OK":"FAIL");
+  }else{Serial.println("FLUSH NO >");}
+  Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();
+  tcpHost[0]=0;tcpPort=0;
 }
 
 // ===== MQTT 发布（含 GPS 坐标 + CSQ）=====
@@ -220,7 +256,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v4.4 ===");
+  Serial.println("\n=== GPS Tracker v7.0 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
@@ -266,7 +302,16 @@ void loop(){
   // GPS
   while(Serial2.available()){
     if(gps.encode(Serial2.read())){
-      if(gps.location.isValid()){lat=gps.location.lat();lng=gps.location.lng();fix=true;}
+      if(gps.location.isValid()){
+        double newLat=gps.location.lat(),newLng=gps.location.lng();
+        if(!fix||newLat!=lat||newLng!=lng){ // 位置变化才记
+          if(fix&&bufN<BUF_MAX&&batReady){
+            GpsPt p={newLat,newLng,alt,(int)spd,sat,bat,battMv,csq};
+            buf[bufN++]=p;
+          }
+          lat=newLat;lng=newLng;fix=true;
+        }
+      }
       if(gps.altitude.isValid())alt=filterAlt(gps.altitude.meters());
       if(gps.speed.isValid())spd=gps.speed.kmph();
       if(gps.satellites.isValid())sat=gps.satellites.value();
@@ -314,16 +359,28 @@ void loop(){
     }
   }
 
-  // ==== 低功耗：三级降频 ====
-  bool idle=(spd<2.0);
-  if(idle){if(lastMoveTime==0)lastMoveTime=millis();}
-  else lastMoveTime=millis();
+  // ==== 低功耗：GPS速度 + 位置变化双判 ====
+  bool movingBySpd=(spd>=2.0);
+  bool movingByPos=false;
+  if(fix){
+    if(lastMoveLat==0&&lastMoveLng==0){lastMoveLat=lat;lastMoveLng=lng;} // 首次定位初始化参考点
+    else{
+      float moveDist=distKm(lastMoveLat,lastMoveLng,lat,lng);
+      movingByPos=(moveDist>5.0); // 5米以上算移动
+    }
+  }
+  if(movingBySpd||movingByPos){
+    lastMoveTime=millis();
+    lastMoveLat=lat;lastMoveLng=lng;
+  }else{
+    if(lastMoveTime==0)lastMoveTime=millis();
+  }
+  bool idle=!(movingBySpd||movingByPos);
   bool deepSleep=(idle&&millis()-lastMoveTime>300000);
   bool lowPower=(idle&&millis()-lastMoveTime>60000);
 
   // 上报间隔
-  int httpIvl=deepSleep?300:lowPower?60:5; if(nightMode&&!lowPower)httpIvl*=2;
-  int mqttIvl=deepSleep?600:lowPower?120:5; if(nightMode&&!lowPower)mqttIvl*=2;
+  int httpIvl=10; // 统一10秒批量上报
 
   static unsigned long lg=0;
   if(millis()-lg>(deepSleep?30000:lowPower?15000:5000)){lg=millis();
@@ -331,30 +388,17 @@ void loop(){
     else Serial.println("GPS: wait...");
   }
 
-  // ==== MQTT 上报（含 GPS 坐标 + CSQ）====
+  // ==== 电量/信号读取（30s）====
   static unsigned long lb=0;
-  if(millis()-lb>mqttIvl*1000){lb=millis();
-    readBattery(); // 读电量和上报频率对齐，DEEP 模式 600s 才读一次
-    readCsq();     // 同上
-    if(fix){
-      char bj[192];
-      snprintf(bj,sizeof(bj),"{\"bat\":%d,\"mv\":%d,\"fix\":1,\"lat\":%.6f,\"lng\":%.6f,\"spd\":%.1f,\"alt\":%.1f,\"sat\":%d,\"csq\":%d}",
-        bat,battMv,lat,lng,spd,alt,sat,csq);
-      Serial.printf("MQTT>> %s\n",bj);
-      mqttPublish("esp32/gps",bj);
-      // 低电量告警（bat 已在 payload 中，仅额外标注 alert 字段）
-      if(batReady && bat>0 && bat<20){
-        char aj[64];snprintf(aj,sizeof(aj),"{\"bat\":%d,\"alert\":\"lowbat\",\"lat\":%.6f,\"lng\":%.6f}",bat,lat,lng);
-        mqttPublish("esp32/gps",aj);
-      }
-    }
+  if(millis()-lb>30000){lb=millis();
+    readBattery();readCsq();
   }
 
-  // ==== HTTP 上报（仅当数据完整：fix + sat>0 + batReady）====
+  // ==== HTTP 批量上报（每 httpIvl 秒 flush 缓冲区）====
   static unsigned long lp=0;
-  if(fix && sat>0 && batReady && millis()-lp>httpIvl*1000){lp=millis();
-    Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f sat=%d bat=%d csq=%d\n",lat,lng,alt,sat,bat,csq);
-    httpReport(lat,lng,alt,spd,sat,bat);
+  if(bufN>0 && millis()-lp>httpIvl*1000){lp=millis();
+    Serial.printf("FLUSH %d pts\n",bufN);
+    httpFlush();
   }
   delay(50);
 }
