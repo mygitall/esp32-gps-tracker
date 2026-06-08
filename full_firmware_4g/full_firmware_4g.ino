@@ -1,8 +1,8 @@
-// ESP32 GPS Tracker v7.0 — 纯HTTP批量上报，关闭MQTT
+// ESP32 GPS Tracker v7.1 — FLUSH失败保留缓冲重试
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#define FW_VER "7.0"
+#define FW_VER "7.1"
 
 #define AIR_RX 4
 #define AIR_TX 5
@@ -182,8 +182,9 @@ void httpFlush(){
   if(!tcpConnect("www.sseeee.com",80)){bufN=0;return;}
   while(Serial1.available())Serial1.read();
   // 用 GET URL 参数拼接多条记录
+  int cnt=bufN; // 保存计数，失败时恢复
   String url="GET /esp32/mmq/receiver.php?batch=";
-  for(int i=0;i<bufN;i++){
+  for(int i=0;i<cnt;i++){
     if(i>0)url+="|";
     char pt[96];
     snprintf(pt,sizeof(pt),"%.6f,%.6f,%.1f,%d,%d,%d,%d,%d",
@@ -197,8 +198,9 @@ void httpFlush(){
   while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
   if(w.indexOf(">")>=0){Serial1.print(url);delay(2000);
     String ok;t=millis();while(millis()-t<3000){while(Serial1.available())ok+=(char)Serial1.read();if(ok.indexOf("SEND OK")>=0||ok.indexOf("ERROR")>=0)break;delay(10);}
-    Serial.printf("FLUSH %s\n",ok.indexOf("SEND OK")>=0?"OK":"FAIL");
-  }else{Serial.println("FLUSH NO >");}
+    if(ok.indexOf("SEND OK")>=0){Serial.println("FLUSH OK");}
+    else{Serial.println("FLUSH FAIL(keep)");bufN=cnt;} // 失败保留数据
+  }else{Serial.println("FLUSH NO >");bufN=cnt;}
   Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();
   tcpHost[0]=0;tcpPort=0;
 }
@@ -256,7 +258,7 @@ void readCsq(){
 // ===== 主程序 =====
 void setup(){
   Serial.begin(115200);delay(500);
-  Serial.println("\n=== GPS Tracker v7.0 ===");
+  Serial.println("\n=== GPS Tracker v7.1 ===");
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
