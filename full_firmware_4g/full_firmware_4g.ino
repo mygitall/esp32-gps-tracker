@@ -382,7 +382,7 @@ void loop(){
   bool lowPower=(idle&&millis()-lastMoveTime>60000);
 
   // 上报间隔
-  int httpIvl=10; // 统一10秒批量上报
+  int httpIvl=5; // 5秒批量上报，低延迟
 
   static unsigned long lg=0;
   if(millis()-lg>(deepSleep?30000:lowPower?15000:5000)){lg=millis();
@@ -398,7 +398,12 @@ void loop(){
 
   // ==== HTTP 批量上报（每 httpIvl 秒 flush 缓冲区）====
   static unsigned long lp=0;
-  if(bufN>0 && millis()-lp>httpIvl*1000){lp=millis();
+  if(millis()-lp>httpIvl*1000){lp=millis();
+    // 即使位置不变也发当前坐标，保证地图实时更新
+    if(bufN==0 && fix && batReady && bufN<BUF_MAX){
+      GpsPt p={lat,lng,alt,(int)spd,sat,bat,battMv,csq};
+      buf[bufN++]=p;
+    }
     Serial.printf("FLUSH %d pts\n",bufN);
     httpFlush();
   }
