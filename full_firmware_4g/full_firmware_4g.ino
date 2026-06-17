@@ -50,7 +50,7 @@ String atCmd(const char* cmd,unsigned long to=3000){
 
 void airPowerOn(){
   pinMode(AIR_PWR,OUTPUT);digitalWrite(AIR_PWR,LOW);delay(200);
-  digitalWrite(AIR_PWR,HIGH);delay(1500);digitalWrite(AIR_PWR,LOW);delay(4000);
+  digitalWrite(AIR_PWR,HIGH);delay(3000);digitalWrite(AIR_PWR,LOW);delay(4000);
 }
 
 // Li-Ion 18650 真实放电曲线 (mV → %)
@@ -103,10 +103,20 @@ void httpReport(float la,float lo,float al,float sp,int sa,int ba,int cs,bool ha
       "GET /esp32/mmq/receiver.php?lat=0.1&lng=0.1&fix=0&csq=%d&battery=%d&mv=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
       cs,ba,bMv,FW_VER,millis()/1000,ESP.getFreeHeap());
   }
-  Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
+  // 关闭上次连接（用 CIPCLOSE 而非 CIPSHUT，保留 PDP 上下文）
+  Serial1.print("AT+CIPCLOSE\r\n");delay(300);while(Serial1.available())Serial1.read();
   String r=atCmd("AT+CIPSTART=\"TCP\",\"shangdy.duckdns.org\",80",10000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
-  if(r.indexOf("CONNECT")<0){Serial.println("HTTP TCP FAIL");Serial1.print("AT+CIPCLOSE\r\n");delay(200);return;}
+  if(r.indexOf("CONNECT")<0){
+    // PDP 可能掉了，重新激活
+    Serial.println("HTTP TCP FAIL, re-PDP...");
+    atCmd("AT+CGATT=1",5000);
+    atCmd("AT+CSTT=\"UNINET\"",2000);
+    atCmd("AT+CIICR",8000);
+    r=atCmd("AT+CIPSTART=\"TCP\",\"shangdy.duckdns.org\",80",10000);
+    t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
+  }
+  if(r.indexOf("CONNECT")<0){Serial.println("HTTP TCP FAIL final");return;}
   while(Serial1.available())Serial1.read();
   Serial1.print("AT+CIPSEND=");Serial1.print(strlen(url));Serial1.print("\r\n");
   String w;t=millis();while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
@@ -122,7 +132,7 @@ void httpReport(float la,float lo,float al,float sp,int sa,int ba,int cs,bool ha
 }
 
 void mqttPublish(const char* topic,const char* payload){
-  Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
+  Serial1.print("AT+CIPCLOSE\r\n");delay(300);while(Serial1.available())Serial1.read();
   String r=atCmd("AT+CIPSTART=\"TCP\",\"broker.emqx.io\",1883",8000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
   if(r.indexOf("CONNECT")<0){Serial.println("MQTT TCP FAIL");return;}
