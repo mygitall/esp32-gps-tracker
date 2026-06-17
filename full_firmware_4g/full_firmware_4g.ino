@@ -89,19 +89,31 @@ bool init4G(){
   return r5.indexOf(".")>0;
 }
 
-void httpReport(float la,float lo,float al,float sp,int sa,int ba){
-  char url[350];
-  snprintf(url,sizeof(url),
-    "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&rssi=%d&ver=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n",
-    la,lo,al,sp,sa,ba,FW_VER,millis()/1000,ESP.getFreeHeap());
+void httpReport(float la,float lo,float al,float sp,int sa,int ba,int cs,bool hasFix){
+  char url[400];
+  if(hasFix){
+    snprintf(url,sizeof(url),
+      "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&csq=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
+      la,lo,al,sp,sa,cs,FW_VER,millis()/1000,ESP.getFreeHeap());
+  } else {
+    snprintf(url,sizeof(url),
+      "GET /esp32/mmq/receiver.php?lat=0.1&lng=0.1&fix=0&csq=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
+      cs,FW_VER,millis()/1000,ESP.getFreeHeap());
+  }
   Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
-  String r=atCmd("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80",10000);
+  String r=atCmd("AT+CIPSTART=\"TCP\",\"shangdy.duckdns.org\",80",10000);
   unsigned long t=millis();while(millis()-t<5000){while(Serial1.available())r+=(char)Serial1.read();if(r.indexOf("CONNECT")>=0)break;delay(50);}
-  if(r.indexOf("CONNECT")<0){Serial1.print("AT+CIPCLOSE\r\n");delay(200);return;}
+  if(r.indexOf("CONNECT")<0){Serial.println("HTTP TCP FAIL");Serial1.print("AT+CIPCLOSE\r\n");delay(200);return;}
   while(Serial1.available())Serial1.read();
   Serial1.print("AT+CIPSEND=");Serial1.print(strlen(url));Serial1.print("\r\n");
   String w;t=millis();while(millis()-t<5000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
-  if(w.indexOf(">")>=0){Serial1.print(url);delay(2000);}
+  if(w.indexOf(">")>=0){
+    Serial1.print(url);
+    // 等 SEND OK 确认数据已发出，否则 CIPCLOSE 会中断发送
+    String ok;t=millis();
+    while(millis()-t<8000){if(Serial1.available()){ok+=(char)Serial1.read();if(ok.indexOf("SEND OK")>=0)break;}delay(1);}
+    if(ok.indexOf("SEND OK")<0)Serial.println("HTTP SEND?");
+  }
   Serial1.print("AT+CIPCLOSE\r\n");delay(200);while(Serial1.available())Serial1.read();
   Serial.println("HTTP OK");
 }
@@ -190,14 +202,14 @@ void loop(){
   static unsigned long lc=0;
   if(millis()-lc>300000){lc=millis();
     Serial1.print("AT+CIPSHUT\r\n");delay(300);while(Serial1.available())Serial1.read();
-    String r=atCmd("AT+CIPSTART=\"TCP\",\"www.sseeee.com\",80",8000);
+    String r=atCmd("AT+CIPSTART=\"TCP\",\"shangdy.duckdns.org\",80",8000);
     if(r.indexOf("CONNECT")>=0){
       while(Serial1.available())Serial1.read();
       Serial1.print("AT+CIPSEND=70\r\n");delay(500);
       String w;unsigned long t=millis();
       while(millis()-t<3000){if(Serial1.available()){w+=(char)Serial1.read();if(w.indexOf(">")>=0)break;}delay(1);}
       if(w.indexOf(">")>=0){
-        Serial1.print("GET /esp32/mmq/cmd_api.php?device=esp32 HTTP/1.1\r\nHost: www.sseeee.com\r\nConnection: close\r\n\r\n");
+        Serial1.print("GET /esp32/mmq/cmd_api.php?device=esp32 HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n");
         delay(2000);
         String resp;while(Serial1.available())resp+=(char)Serial1.read();
         if(resp.indexOf("\"reboot\"")>=0){Serial.println("CMD:reboot");ESP.restart();}
@@ -221,12 +233,14 @@ void loop(){
     else Serial.println("GPS: wait...");
   }
 
-  // 电量（每30秒读一次，避免频繁AT命令）
-  static unsigned long bt=0; static int bat=0;
+  // 电量 + 信号（每30秒读一次，避免频繁AT命令）
+  static unsigned long bt=0; static int bat=0,csq=0;
   if(millis()-bt>30000){bt=millis();
     atCmd("AT",1000); // 唤醒模块
     String cbc=atCmd("AT+CBC",5000);
     int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=lipoPct(mv);}
+    String cs=atCmd("AT+CSQ",2000);
+    p=cs.indexOf("+CSQ:");if(p>=0)csq=cs.substring(p+5).toInt();
   }
   static bool batAlert=false;if(bat<20&&!batAlert){batAlert=true;}if(bat>25)batAlert=false;
 
@@ -240,12 +254,13 @@ void loop(){
     Serial.println("MQTT done");
   }
 
-  // HTTP 上报（正常20s，LP 60s，DEEP 300s，夜间×2）
+  // HTTP 上报（有fix时正常20s，无fix时心跳60s）
   static unsigned long lp=0;
-  int httpIvl=deepSleep?300:lowPower?60:20; if(nightMode&&!lowPower)httpIvl*=2;
-  if(fix&&millis()-lp>httpIvl*1000){lp=millis();
-    Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f\n",lat,lng,alt);
-    httpReport(lat,lng,alt,spd,sat,bat);
+  int httpIvl=fix?(deepSleep?300:lowPower?60:20):60; if(nightMode&&!lowPower)httpIvl*=2;
+  if(millis()-lp>httpIvl*1000){lp=millis();
+    if(fix)Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f\n",lat,lng,alt);
+    else Serial.printf("HTTP heartbeat csq=%d\n",csq);
+    httpReport(lat,lng,alt,spd,sat,bat,csq,fix);
     if(bat<20){char aj[32];snprintf(aj,sizeof(aj),"{\"alert\":\"lowbat\",\"bat\":%d}",bat);mqttPublish("esp32/gps",aj);}
   }
   delay(50);
