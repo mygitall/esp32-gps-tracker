@@ -50,7 +50,7 @@ String atCmd(const char* cmd,unsigned long to=3000){
 
 void airPowerOn(){
   pinMode(AIR_PWR,OUTPUT);digitalWrite(AIR_PWR,LOW);delay(200);
-  digitalWrite(AIR_PWR,HIGH);delay(1000);digitalWrite(AIR_PWR,LOW);delay(4000);
+  digitalWrite(AIR_PWR,HIGH);delay(1200);digitalWrite(AIR_PWR,LOW);delay(4000);
 }
 
 // Li-Ion 18650 真实放电曲线 (mV → %)
@@ -63,21 +63,23 @@ int lipoPct(int mv){
 }
 
 bool init4G(){
-  // 自动 PWRKEY：每次开机固定触发，最多三次
+  // 先探测模块是否已开机（OTA 重启场景），避免误关
+  String pre=atCmd("AT",2000);
+  if(pre.indexOf("OK")>=0){Serial.println("4G already ON");goto pdp;}
+  // 模块未开机，PWRKEY 触发，最多三次
   for(int cycle=0;cycle<3;cycle++){
     Serial.printf("PWRKEY 触发 (%d/3)...\n",cycle+1);
-    airPowerOn();  // GPIO27 HIGH → S8050导通 → PWRKEY拉低1秒
-    // 等 Air780EX 完全启动
+    airPowerOn();  // GPIO27 HIGH → S8050导通 → PWRKEY拉低1.2秒
     delay(8000);
     for(int i=0;i<10;i++){
       String r=atCmd("AT",2000);
-      if(r.indexOf("OK")>=0){Serial.println("AT OK");goto ok;}
+      if(r.indexOf("OK")>=0){Serial.println("AT OK");goto pdp;}
       Serial.printf("  retry %d/10\n",i+1);
       delay(1000);
     }
   }
   Serial.println("AT FAIL");return false;
-  ok:
+  pdp:
   Serial.println("AT OK, init PDP...");
   String r1=atCmd("AT+CSQ",2000); Serial.printf("CSQ:%s\n",r1.c_str());
   String r2=atCmd("AT+CGATT=1",5000); Serial.printf("ATT:%s\n",r2.c_str());
@@ -131,6 +133,7 @@ void setup(){
   pinMode(2,OUTPUT);digitalWrite(2,LOW);
   Serial2.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   Serial1.begin(115200,SERIAL_8N1,AIR_RX,AIR_TX);
+  delay(3000);  // 等 Air780EX VBAT 供电稳定
 
   // WiFi OTA（尝试连接家里WiFi）
   WiFi.begin(WIFI_SSID,WIFI_PASS);
