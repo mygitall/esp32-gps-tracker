@@ -50,7 +50,7 @@ String atCmd(const char* cmd,unsigned long to=3000){
 
 void airPowerOn(){
   pinMode(AIR_PWR,OUTPUT);digitalWrite(AIR_PWR,LOW);delay(200);
-  digitalWrite(AIR_PWR,HIGH);delay(1200);digitalWrite(AIR_PWR,LOW);delay(4000);
+  digitalWrite(AIR_PWR,HIGH);delay(1500);digitalWrite(AIR_PWR,LOW);delay(4000);
 }
 
 // Li-Ion 18650 真实放电曲线 (mV → %)
@@ -63,13 +63,16 @@ int lipoPct(int mv){
 }
 
 bool init4G(){
-  // 先探测模块是否已开机（OTA 重启场景），避免误关
-  String pre=atCmd("AT",2000);
-  if(pre.indexOf("OK")>=0){Serial.println("4G already ON");goto pdp;}
-  // 模块未开机，PWRKEY 触发，最多三次
+  // 多次 AT 唤醒探测（模块可能在 CSCLK=2 休眠中）
+  for(int w=0;w<3;w++){
+    Serial1.print("AT\r\n");delay(300);
+    String pre=atCmd("AT",3000);
+    if(pre.indexOf("OK")>=0){Serial.println("4G already ON");goto pdp;}
+  }
+  // 模块确实未开机，PWRKEY 触发
   for(int cycle=0;cycle<3;cycle++){
     Serial.printf("PWRKEY 触发 (%d/3)...\n",cycle+1);
-    airPowerOn();  // GPIO27 HIGH → S8050导通 → PWRKEY拉低1.2秒
+    airPowerOn();  // GPIO27 HIGH → S8050导通 → PWRKEY拉低1.5秒
     delay(8000);
     for(int i=0;i<10;i++){
       String r=atCmd("AT",2000);
@@ -89,16 +92,16 @@ bool init4G(){
   return r5.indexOf(".")>0;
 }
 
-void httpReport(float la,float lo,float al,float sp,int sa,int ba,int cs,bool hasFix){
-  char url[400];
+void httpReport(float la,float lo,float al,float sp,int sa,int ba,int cs,bool hasFix,int bMv){
+  char url[450];
   if(hasFix){
     snprintf(url,sizeof(url),
-      "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&csq=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
-      la,lo,al,sp,sa,cs,FW_VER,millis()/1000,ESP.getFreeHeap());
+      "GET /esp32/mmq/receiver.php?lat=%.6f&lng=%.6f&alt=%.1f&spd=%.1f&sat=%d&fix=1&csq=%d&battery=%d&mv=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
+      la,lo,al,sp,sa,cs,ba,bMv,FW_VER,millis()/1000,ESP.getFreeHeap());
   } else {
     snprintf(url,sizeof(url),
-      "GET /esp32/mmq/receiver.php?lat=0.1&lng=0.1&fix=0&csq=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
-      cs,FW_VER,millis()/1000,ESP.getFreeHeap());
+      "GET /esp32/mmq/receiver.php?lat=0.1&lng=0.1&fix=0&csq=%d&battery=%d&mv=%d&fw=%s&uptime=%lu&heap=%u HTTP/1.1\r\nHost: shangdy.duckdns.org\r\nConnection: close\r\n\r\n",
+      cs,ba,bMv,FW_VER,millis()/1000,ESP.getFreeHeap());
   }
   Serial1.print("AT+CIPSHUT\r\n");delay(500);while(Serial1.available())Serial1.read();
   String r=atCmd("AT+CIPSTART=\"TCP\",\"shangdy.duckdns.org\",80",10000);
@@ -234,11 +237,11 @@ void loop(){
   }
 
   // 电量 + 信号（每30秒读一次，避免频繁AT命令）
-  static unsigned long bt=0; static int bat=0,csq=0;
+  static unsigned long bt=0; static int bat=0,batMv=0,csq=0;
   if(millis()-bt>30000){bt=millis();
     atCmd("AT",1000); // 唤醒模块
     String cbc=atCmd("AT+CBC",5000);
-    int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0)bat=lipoPct(mv);}
+    int p=cbc.indexOf("+CBC:");if(p>=0){int mv=cbc.substring(p+5).toInt();if(mv>0){batMv=mv;bat=lipoPct(mv);}}
     String cs=atCmd("AT+CSQ",2000);
     p=cs.indexOf("+CSQ:");if(p>=0)csq=cs.substring(p+5).toInt();
   }
@@ -260,7 +263,7 @@ void loop(){
   if(millis()-lp>httpIvl*1000){lp=millis();
     if(fix)Serial.printf("HTTP>> lat=%.6f lng=%.6f alt=%.1f\n",lat,lng,alt);
     else Serial.printf("HTTP heartbeat csq=%d\n",csq);
-    httpReport(lat,lng,alt,spd,sat,bat,csq,fix);
+    httpReport(lat,lng,alt,spd,sat,bat,csq,fix,batMv);
     if(bat<20){char aj[32];snprintf(aj,sizeof(aj),"{\"alert\":\"lowbat\",\"bat\":%d}",bat);mqttPublish("esp32/gps",aj);}
   }
   delay(50);
