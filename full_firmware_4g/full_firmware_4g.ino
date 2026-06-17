@@ -162,7 +162,7 @@ void setup(){
 
   if(init4G()){
     Serial.println("4G OK");
-    atCmd("AT+CSCLK=2");  // Air780EX 空闲自动休眠（省电 ~100mA）
+    atCmd("AT+CSCLK=0");  // 关闭休眠，LED保持闪烁（耗电增加~100mA）
   }else{Serial.println("4G FAIL");}
 }
 
